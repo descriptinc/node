@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <errno.h>
+#include <string.h>
 
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -35,6 +36,7 @@
 
 #if defined(__APPLE__) && !TARGET_OS_IPHONE
 # include <spawn.h>
+# include <paths.h>
 # include <sys/kauth.h>
 # include <dlfcn.h>
 # include <crt_externs.h>
@@ -609,6 +611,104 @@ error:
   return err;
 }
 
+char* uv__spawn_find_path_in_env(char** env) {
+  char** env_iterator = env;
+
+  /* Look for an environment variable called PATH in the 
+   * provided env array, and return its value if found */
+  while (*env_iterator != NULL) {
+    const char* path_name = strstr(*env_iterator, "PATH=");
+    if(path_name != NULL && path_name == *env_iterator) {
+      /* Found "PATH=" at the beginning of the string */
+      return strchr(path_name, '=') + 1;
+    }
+
+    ++env_iterator;
+  }
+
+  return NULL;
+}
+
+int uv__spawn_resolve_and_spawn(const uv_process_options_t* options, 
+                                posix_spawnattr_t* attrs,
+                                posix_spawn_file_actions_t* actions,
+                                pid_t* pid) {
+	const char *p, *z, *path = NULL;
+	size_t l, k;
+  int err = -1;
+
+  /* Short circuit for erroneous case */
+	if (options->file == NULL) 
+    return UV_ENOENT;
+
+  /* The environment for the child process is that of the parent unless overriden 
+   * by options->env */
+  char** env = environ;
+  if (options->env != NULL) {
+    env = options->env;
+  }
+
+  /* If options->file contains a slash, posix_spawn/posix_spawnp behave
+   * the same, and don't involve PATH resolution at all */
+	if (strchr(options->file, '/') != NULL)
+		return posix_spawn(pid, options->file, actions, attrs, options->args, env);
+
+  /* If no custom environment is to be used, the environment used for path 
+   * resolution as well for the child process is that of the parent process */
+  if (options->env == NULL) {
+    return posix_spawn(pid, options->file, actions, attrs, options->args, env);
+  }
+
+  /* Loof for the definition of PATH in the provided env */
+  path = uv__spawn_find_path_in_env(options->env);
+
+  /* The followingresolution logic (execvpe emulation) is taken from 
+   * https://github.com/JuliaLang/libuv/commit/9af3af617138d6a6de7d72819ed362996ff255d9
+   * and adapted to work around our own situations */
+
+  /* If no path was provided in options->env, use the default value 
+   * to look for the executable */
+	if (!path) 
+    path = _PATH_DEFPATH;
+
+	k = strnlen(options->file, NAME_MAX+1);
+	if (k > NAME_MAX) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+
+	l = strnlen(path, PATH_MAX-1)+1;
+
+	for(p=path; ; p=z) {
+    /* Compose the new process file from the entry in the PATH
+     * environment variable and the actual file name */
+		char b[l+k+1];
+		z = strchr(p, ':');
+		if (!z) 
+      z = p+strlen(p);
+		if ((size_t)(z-p) >= l) {
+			if (!*z++) 
+        break;
+			
+      continue;
+		}
+		memcpy(b, p, z-p);
+		b[z-p] = '/';
+		memcpy(b+(z-p)+(z>p), options->file, k+1);
+
+    /* Try to spawn the new process file. If it fails with ENOENT, the
+     * new process file is not in this PATH entry, continue with the next
+     * PATH entry. Stop when  */
+		err = posix_spawn(pid, b, actions, attrs, options->args, env);
+		if (err != ENOENT) 
+      return err;
+
+		if (!*z++) 
+      break;
+	}
+
+	return err;
+}
 
 int uv__spawn_and_init_child_posix_spawn(const uv_process_options_t* options,
                                          int stdio_count,
@@ -619,7 +719,7 @@ int uv__spawn_and_init_child_posix_spawn(const uv_process_options_t* options,
   posix_spawnattr_t attrs;
   posix_spawn_file_actions_t actions;
 
-  fprintf(stderr, "[LIBUV] USING POSIX_SPAWN\n");
+  fprintf(stderr, "[LIBUV] USING POSIX_SPAWN (v2)\n");
 
   err = uv__spawn_set_posix_spawn_attrs(&attrs, posix_spawn_fncs, options);
   if (err != 0) 
@@ -631,11 +731,9 @@ int uv__spawn_and_init_child_posix_spawn(const uv_process_options_t* options,
     goto error;
   }
 
-  /*  Preserve parent environment if not explicitly set */
-  char** env = options->env ? options->env : environ;
-
-  /*  Spawn the child */
-  err = posix_spawnp(pid, options->file, &actions, &attrs, options->args, env);
+  /* Try to spawn options->file resolving in the provided environment 
+   * if any */
+  err = uv__spawn_resolve_and_spawn(options, &attrs, &actions, pid);
 
   /* Destroy the actions/attributes */
   (void) posix_spawn_file_actions_destroy(&actions);
