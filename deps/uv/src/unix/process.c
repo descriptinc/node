@@ -590,18 +590,21 @@ int uv__spawn_set_posix_spawn_file_actions(posix_spawn_file_actions_t* actions,
 
   /*  Finally process the standard streams as per documentation */
   for (fd = 0 ; fd < 3 ; fd++) {
-    /*  If ignored, open as /dev/null */
     int oflags;
     const int mode = 0;
 
     oflags = fd == 0 ? O_RDONLY : O_RDWR;
 
-    if (pipes[fd][1] != -1) 
-      continue;
+    if (pipes[fd][1] != -1) {
+      /* If not ignored, make sure the fd is marked as non-blocking */
+      uv__nonblock_fcntl(pipes[fd][1], 0);
+    } else {
+      /* If ignored, redirect to (or from) /dev/null, */
+      err = posix_spawn_file_actions_addopen(actions, fd, "/dev/null", oflags, mode);
+      if (err != 0)
+        goto error;
+    }
     
-    err = posix_spawn_file_actions_addopen(actions, fd, "/dev/null", oflags, mode);
-    if (err != 0)
-      goto error;
   }  
 
   return 0;
@@ -633,12 +636,12 @@ int uv__spawn_resolve_and_spawn(const uv_process_options_t* options,
                                 posix_spawnattr_t* attrs,
                                 posix_spawn_file_actions_t* actions,
                                 pid_t* pid) {
-	const char *p, *z, *path = NULL;
-	size_t l, k;
+  const char *p, *z, *path = NULL;
+  size_t l, k;
   int err = -1;
 
   /* Short circuit for erroneous case */
-	if (options->file == NULL) 
+  if (options->file == NULL) 
     return UV_ENOENT;
 
   /* The environment for the child process is that of the parent unless overriden 
@@ -649,65 +652,64 @@ int uv__spawn_resolve_and_spawn(const uv_process_options_t* options,
   }
 
   /* If options->file contains a slash, posix_spawn/posix_spawnp behave
-   * the same, and don't involve PATH resolution at all */
-	if (strchr(options->file, '/') != NULL)
-		return posix_spawn(pid, options->file, actions, attrs, options->args, env);
-
-  /* If no custom environment is to be used, the environment used for path 
-   * resolution as well for the child process is that of the parent process */
-  if (options->env == NULL) {
-    return posix_spawn(pid, options->file, actions, attrs, options->args, env);
+   * the same, and don't involve PATH resolution at all. Otherwise, if
+   * options->file does not include a slash, but no custom environment is 
+   * to be used, the environment used for path  resolution as well for the 
+   * child process is that of the parent process, so posix_spawnp is the
+   * way to go. */
+  if (strchr(options->file, '/') != NULL || options->env == NULL) {
+    return posix_spawnp(pid, options->file, actions, attrs, options->args, env);
   }
 
-  /* Loof for the definition of PATH in the provided env */
+  /* Look for the definition of PATH in the provided env */
   path = uv__spawn_find_path_in_env(options->env);
 
-  /* The followingresolution logic (execvpe emulation) is taken from 
+  /* The following resolution logic (execvpe emulation) is taken from 
    * https://github.com/JuliaLang/libuv/commit/9af3af617138d6a6de7d72819ed362996ff255d9
    * and adapted to work around our own situations */
 
   /* If no path was provided in options->env, use the default value 
    * to look for the executable */
-	if (!path) 
+  if (!path) 
     path = _PATH_DEFPATH;
 
-	k = strnlen(options->file, NAME_MAX+1);
-	if (k > NAME_MAX) {
-		errno = ENAMETOOLONG;
-		return -1;
-	}
+  k = strnlen(options->file, NAME_MAX+1);
+  if (k > NAME_MAX) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
 
-	l = strnlen(path, PATH_MAX-1)+1;
+  l = strnlen(path, PATH_MAX-1)+1;
 
-	for(p=path; ; p=z) {
+  for(p=path; ; p=z) {
     /* Compose the new process file from the entry in the PATH
      * environment variable and the actual file name */
-		char b[l+k+1];
-		z = strchr(p, ':');
-		if (!z) 
+    char b[l+k+1];
+    z = strchr(p, ':');
+    if (!z) 
       z = p+strlen(p);
-		if ((size_t)(z-p) >= l) {
-			if (!*z++) 
+    if ((size_t)(z-p) >= l) {
+      if (!*z++) 
         break;
-			
+      
       continue;
-		}
-		memcpy(b, p, z-p);
-		b[z-p] = '/';
-		memcpy(b+(z-p)+(z>p), options->file, k+1);
+    }
+    memcpy(b, p, z-p);
+    b[z-p] = '/';
+    memcpy(b+(z-p)+(z>p), options->file, k+1);
 
     /* Try to spawn the new process file. If it fails with ENOENT, the
      * new process file is not in this PATH entry, continue with the next
-     * PATH entry. Stop when  */
-		err = posix_spawn(pid, b, actions, attrs, options->args, env);
-		if (err != ENOENT) 
+     * PATH entry. */
+    err = posix_spawn(pid, b, actions, attrs, options->args, env);
+    if (err != ENOENT) 
       return err;
 
-		if (!*z++) 
+    if (!*z++) 
       break;
-	}
+  }
 
-	return err;
+  return err;
 }
 
 int uv__spawn_and_init_child_posix_spawn(const uv_process_options_t* options,
